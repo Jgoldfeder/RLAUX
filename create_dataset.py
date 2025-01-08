@@ -2,7 +2,7 @@ from torch.utils.data.dataset import Dataset
 from torchvision import transforms
 from PIL import Image
 from torchvision.datasets.utils import download_url, check_integrity
-
+import random
 import os
 import pickle
 import numpy as np
@@ -130,3 +130,66 @@ class CIFAR100(Dataset):
 
     def __len__(self):
         return self.data_len
+
+
+class ImbalancedDatasetWrapper(Dataset):
+    def __init__(self, dataset, label_index, classes_to_imbalance, keep_percentage=1):
+        """
+        Args:
+            dataset (Dataset): The original dataset.
+            label_index (int): Index (0, 1, 2, or 3) of the label to focus on.
+            classes_to_imbalance (list): List of class labels to make imbalanced.
+            keep_percentage (float): Percentage of samples to keep from each class (0-100).
+        """
+        self.dataset = dataset
+        self.label_index = label_index
+        self.classes_to_imbalance = classes_to_imbalance
+        self.keep_percentage = keep_percentage
+        
+        # Filter the dataset
+        self.filtered_indices = self._filter_dataset()
+    
+    def _filter_dataset(self):
+        """
+        Filters the dataset based on the keep_percentage for specified classes.
+        
+        Returns:
+            list: List of indices for the modified dataset.
+        """
+        class_indices = {cls: [] for cls in self.classes_to_imbalance}
+        other_indices = []
+        
+        # Group indices by class or keep them as others
+        for idx in range(len(self.dataset)):
+            _, labels = self.dataset[idx]  # Assumes dataset[idx] returns (image, labels)
+            class_label = labels[self.label_index]
+            
+            if class_label in self.classes_to_imbalance:
+                class_indices[class_label].append(idx)
+            else:
+                other_indices.append(idx)
+        
+        # Filter out samples based on the keep_percentage
+        for cls in self.classes_to_imbalance:
+            indices = class_indices[cls]
+            random.shuffle(indices)
+            keep_count = int(len(indices) * self.keep_percentage / 100)
+            class_indices[cls] = indices[:keep_count]
+            print(f"Class {cls}: {len(class_indices[cls])} samples kept out of {len(indices)}")
+        
+        # Combine filtered indices
+        filtered_indices = other_indices
+        for indices in class_indices.values():
+            filtered_indices.extend(indices)
+        
+        return filtered_indices
+    
+    def __len__(self):
+        return len(self.filtered_indices)
+    
+    def __getitem__(self, idx):
+        """
+        Access the modified dataset.
+        """
+        original_idx = self.filtered_indices[idx]
+        return self.dataset[original_idx]
