@@ -21,8 +21,16 @@ import torchvision.transforms as transforms
 from create_dataset import CIFAR100,ImbalancedDatasetWrapper
 from torch.utils.data import Dataset
 from sklearn.metrics import f1_score
+import sys
 
 softmax= nn.Softmax(dim=-1)
+
+seed = int(sys.argv[1])
+
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+
 
 
 def f1_score_from_logits(logits, labels):
