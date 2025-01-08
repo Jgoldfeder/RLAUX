@@ -10,7 +10,36 @@ import torchvision.transforms as transforms
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.utils.data.sampler as sampler
+import sys
+from sklearn.metrics import f1_score
 
+seed = int(sys.argv[1])
+
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+
+def f1_score_from_logits(logits, labels):
+    """
+    Compute the F1 score from logits and labels for a multiclass classification task.
+
+    Args:
+    - logits (torch.Tensor): A tensor of shape (batch_size, num_classes) representing the model's raw predictions.
+    - labels (torch.Tensor): A tensor of shape (batch_size,) containing the true class labels.
+
+    Returns:
+    - float: The macro-averaged F1 score.
+    """
+    # Convert logits to predicted labels
+    preds = torch.argmax(logits, dim=1)
+    
+    # Detach tensors and move them to CPU for compatibility with sklearn
+    preds = preds.cpu().detach().numpy()
+    labels = labels.cpu().detach().numpy()
+
+    # Compute the macro-averaged F1 score
+    f1 = f1_score(labels, preds, average='macro')
+    return f1
 
 # --------------------------------------------------------------------------------
 # Define network
@@ -318,6 +347,7 @@ trans_test = transforms.Compose([
 # set keyword download=True at the first time to download the dataset
 cifar100_train_set = CIFAR100(root='dataset', train=True, transform=trans_train, download=False)
 cifar100_test_set = CIFAR100(root='dataset', train=False, transform=trans_test, download=False)
+#cifar100_train_set = ImbalancedDatasetWrapper(cifar100_train_set,2,[0,1,2,3,4,5,6,7,8,9])
 
 batch_size = 100
 kwargs = {'num_workers': 1, 'pin_memory': True}
@@ -416,6 +446,10 @@ for index in range(total_epoch):
 
     # evaluate on test data
     VGG16_model.eval()
+    get_f1=True
+    if get_f1:
+        all_logits = []
+        all_labels = []
     with torch.no_grad():
         cifar100_test_dataset = iter(cifar100_test_loader)
         for i in range(test_batch):
@@ -428,7 +462,9 @@ for index in range(total_epoch):
 
             test_predict_label1 = test_pred1.data.max(1)[1]
             test_acc1 = test_predict_label1.eq(test_label[:, 2]).sum().item() / batch_size
-
+            if get_f1:
+                all_logits.append(test_pred1)
+                all_labels.append( test_label[:,2])
             cost[0] = torch.mean(test_loss1).item()
             cost[1] = test_acc1
 
@@ -436,6 +472,14 @@ for index in range(total_epoch):
 
     scheduler.step()
     gen_scheduler.step()
+    if get_f1:
+        all_logits = torch.cat(all_logits, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+
+        # Compute F1 score over the entire epoch
+        f1_epoch = f1_score_from_logits(all_logits, all_labels)
+        print("f1",f1_epoch)
+
     print('EPOCH: {:04d} Iter {:04d} | TRAIN [LOSS|ACC.]: PRI {:.4f} {:.4f} COSSIM {:.4f} || TEST: {:.4f} {:.4f}'
           .format(index, k, avg_cost[index][0], avg_cost[index][1], avg_cost[index][2], avg_cost[index][3],
                   avg_cost[index][4]))
