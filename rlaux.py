@@ -18,9 +18,35 @@ import sys
 from stable_baselines3 import PPO
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
-from create_dataset import CIFAR100
+from create_dataset import CIFAR100,ImbalancedDatasetWrapper
 from torch.utils.data import Dataset
+from sklearn.metrics import f1_score
 
+softmax= nn.Softmax(dim=-1)
+
+
+def f1_score_from_logits(logits, labels):
+    """
+    Compute the F1 score from logits and labels for a multiclass classification task.
+
+    Args:
+    - logits (torch.Tensor): A tensor of shape (batch_size, num_classes) representing the model's raw predictions.
+    - labels (torch.Tensor): A tensor of shape (batch_size,) containing the true class labels.
+
+    Returns:
+    - float: The macro-averaged F1 score.
+    """
+    # Convert logits to predicted labels
+    preds = torch.argmax(logits, dim=1)
+    
+    # Detach tensors and move them to CPU for compatibility with sklearn
+    preds = preds.cpu().detach().numpy()
+    labels = labels.cpu().detach().numpy()
+
+    # Compute the macro-averaged F1 score
+    f1 = f1_score(labels, preds, average='macro')
+    
+    return f1
 # Load Datasets
 
 class LabelTransformDataset(Dataset):
@@ -60,6 +86,7 @@ trans_test = transforms.Compose([
 # set keyword download=True at the first time to download the dataset
 cifar100_train_set = CIFAR100(root='dataset', train=True, transform=trans_train, download=True)
 cifar100_test_set = CIFAR100(root='dataset', train=False, transform=trans_test, download=True)
+#cifar100_train_set = ImbalancedDatasetWrapper(cifar100_train_set,2,[0,1,2,3,4,5,6,7,8,9])
 
 cifar100_train_set = LabelTransformDataset(cifar100_train_set, label_transform=lambda x: x[ 2].astype(np.int64) )
 cifar100_test_set = LabelTransformDataset(cifar100_test_set, label_transform=lambda x: x[ 2].astype(np.int64) )
@@ -268,10 +295,13 @@ class SeededSubsetRandomSampler(SubsetRandomSampler):
             # Default behavior if no seed is provided
             return super().__iter__()
         
-def evaluate(model, data_loader, criterion, device):
+def evaluate(model, data_loader, criterion, device,get_f1=False):
     model.eval()
     total_loss = 0
     correct = 0
+    if get_f1:
+        all_logits = []
+        all_labels = []
     with torch.no_grad():
         for inputs, labels in data_loader:
             inputs, labels = inputs.to(device), labels.to(device)
@@ -280,7 +310,19 @@ def evaluate(model, data_loader, criterion, device):
             total_loss += loss.item()
             _, predicted = torch.max(class_output, 1)
             correct += (predicted == labels).sum().item()
+            if get_f1:
+                all_logits.append(class_output)
+                all_labels.append(labels)
+
     accuracy = correct / len(data_loader.dataset)
+    if get_f1:
+        # Concatenate all batches into a single tensor
+        all_logits = torch.cat(all_logits, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+
+        # Compute F1 score over the entire epoch
+        f1_epoch = f1_score_from_logits(all_logits, all_labels)
+        return total_loss / len(data_loader), accuracy,f1_epoch
     return total_loss / len(data_loader), accuracy
 
 # define RL environment
@@ -317,7 +359,7 @@ class AuxTaskEnv(gym.Env):
         # create endless sampler for reward sampling 
         sampler = RandomSampler(train_dataset, replacement=True,num_samples=sys.maxsize )
         self.reward_sampler = iter( DataLoader(train_dataset, batch_size=256, sampler=sampler))
-
+        self.reward_mode = True # toggle reward calculation when not training
         
         # Define action and observation space
         image_obs = spaces.Box(low=0, high=1, shape=(batch_size, 3, 32, 32), dtype=np.float32)
@@ -365,7 +407,7 @@ class AuxTaskEnv(gym.Env):
         # Evaluate the network on train and test sets
         if self.model is not None:
           train_accuracy = evaluate(self.model, self.train_loader,self.criterion, self.device)
-          test_accuracy = evaluate(self.model, test_loader,self.criterion, self.device)
+          test_accuracy = evaluate(self.model, test_loader,self.criterion, self.device,get_f1=True)
 
           print("Train Accuracy",train_accuracy)
           print("Test Accuracy",test_accuracy)
@@ -406,10 +448,28 @@ class AuxTaskEnv(gym.Env):
         self.optimizer.zero_grad()
         class_output, aux_output = self.model(inputs)
 
-        # define max softmax as per MAXL paper
-        def mask_softmax( x, mask, dim=1):
-            logits = torch.exp(x) * mask / torch.sum(torch.exp(x) * mask, dim=dim, keepdim=True)
-            return logits
+        # # define max softmax as per MAXL paper
+        # def mask_softmax( x, mask, dim=1):
+        #     logits = torch.exp(x) * mask / torch.sum(torch.exp(x) * mask, dim=dim, keepdim=True)
+        #     return logits
+        def mask_softmax(x, mask, dim=1, epsilon=1e-8):
+            if x.isnan().any():
+                print("input is NAN")
+            # Subtract the max value from logits (x) for numerical stability
+            logits_max = torch.max(x, dim=dim, keepdim=True)[0]
+            exp_logits = torch.exp(x - logits_max)  # Exponentiate the shifted logits
+
+            # Apply mask to the exponentiated logits
+            masked_exp_logits = exp_logits * mask
+
+            # Ensure no division by zero by adding epsilon
+            masked_sum = torch.sum(masked_exp_logits, dim=dim, keepdim=True) + epsilon
+
+            # Normalize the masked logits by the sum along the specified dimension
+            softmax_logits = masked_exp_logits / masked_sum
+            if softmax_logits.isnan().any():
+                print("logits is NAN")
+            return softmax_logits
         
         # create the mask
         def create_mask_from_labels(labels, num_classes=20, num_features=100):
@@ -432,12 +492,13 @@ class AuxTaskEnv(gym.Env):
 
         mask=create_mask_from_labels(labels).to(self.device)
         aux_target=mask_softmax(torch.tensor(action).to(self.device),mask,dim=-1)
-
+        #for i, label in enumerate(labels):
+        #    print(aux_target[i][label*5:label*5+5])
         # Calculate classification loss and auxiliary loss
         #loss_class = self.criterion(class_output, labels)
         #loss_aux = self.criterion(aux_output, aux_target)
-        loss_class   =  torch.mean(self.model.model_fit(nn.Softmax()(class_output), labels, pri=True,num_output=20))
-        loss_aux  =  torch.mean(self.model.model_fit(nn.Softmax()(aux_output), aux_target,pri=False, num_output=100))
+        loss_class   =  torch.mean(self.model.model_fit(softmax(class_output), labels, pri=True,num_output=20))
+        loss_aux  =  torch.mean(self.model.model_fit(softmax(aux_output), aux_target,pri=False, num_output=100))
 
         
         info = {"loss_main" : loss_class.item(), "loss_aux": loss_aux.item() }
@@ -457,17 +518,24 @@ class AuxTaskEnv(gym.Env):
 
         # Reward is based on reduction in loss, but classification accuracy also may make sense
         with torch.no_grad():
-            # get random sample of dataset with replacement
-            current_batch, current_labels = next(self.reward_sampler)
-            inputs, labels = current_batch.to(self.device),current_labels.to(self.device)
+            reward=0
+            if self.reward_mode:
+                reward_type = "loss"
+                # get random sample of dataset with replacement
+                current_batch, current_labels = next(self.reward_sampler)
+                inputs, labels = current_batch.to(self.device),current_labels.to(self.device)
 
-            # get loss on updated model
-            class_output, aux_output = self.model(inputs)
-            loss_class_new = self.criterion(class_output, labels)
-            reward =  - loss_class_new.item()
-            entropy=0.2*torch.mean(self.model.model_entropy(aux_target))
-            reward -= entropy
-            self.return_+=reward
+                # get loss on updated model
+                class_output, aux_output = self.model(inputs)
+                loss_class_new = self.criterion(class_output, labels)
+                if reward_type == "loss":
+                    reward =  - loss_class_new.item()
+                else:
+                    reward =f1_score_from_logits(class_output,labels)
+
+                entropy=0.2*torch.mean(self.model.model_entropy(aux_target))
+                reward -= entropy
+                self.return_+=reward
         
         # make sure batch size is correct. May be less on final iteration
         inputs, labels = self.current_batch, self.current_labels 
@@ -520,13 +588,15 @@ def train_label_network_with_rl(model,env):
     model.learn(total_timesteps=episode_length)
     
 def train_main_network(model, env):
+    env.reward_mode=False
     obs = env.reset()
     done = False
     while not done:
         action, _states = model.predict(obs, deterministic=True)  # Use deterministic greedy actions
         obs, reward, done, _info = env.step(action)
     env.update()
-         
+    env.reward_mode=True
+      
 
 # Train
 BATCH_SIZE=100
@@ -561,7 +631,11 @@ for index in range(total_epoch):
     model.eval()
     # evaluating test data
     cost = np.zeros(4, dtype=np.float32)
+    get_f1=True
     with torch.no_grad():
+        if get_f1:
+            all_logits = []
+            all_labels = []
         cifar100_test_dataset = iter(cifar100_test_loader)
         for i in range(test_batch):
             test_data, test_label =  next(cifar100_test_dataset) #cifar100_test_dataset.next()
@@ -569,9 +643,12 @@ for index in range(total_epoch):
             test_data, test_label = test_data.to(device), test_label.to(device)
 
             test_pred1, test_pred2 = model(test_data)
-            test_pred1, test_pred2 = nn.Softmax()(test_pred1),nn.Softmax()(test_pred2)
+            test_pred1, test_pred2 = softmax(test_pred1),softmax(test_pred2)
+            if get_f1:
+                all_logits.append(test_pred1)
+                all_labels.append(test_label)
             #print(ppo_model.policy({"image":test_data.unsqueeze(0), "array": test_label.unsqueeze(0)})[0].shape)
-            aux_label = nn.Softmax()(ppo_model.policy({"image":test_data.unsqueeze(0), "array": test_label.unsqueeze(0)})[0].squeeze(0))
+            aux_label = softmax(ppo_model.policy({"image":test_data.unsqueeze(0), "array": test_label.unsqueeze(0)})[0].squeeze(0))
             
             test_loss1  = model.model_fit(test_pred1, test_label, pri=True,num_output=20)
             test_loss2  = model.model_fit(test_pred2, aux_label,pri=False, num_output=100)
@@ -588,7 +665,13 @@ for index in range(total_epoch):
             cost[2] = torch.mean(test_loss2).item()
             cost[3] = test_acc2
             avg_cost[index][4:] += cost / test_batch
+    if get_f1:
+        all_logits = torch.cat(all_logits, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
 
+        # Compute F1 score over the entire epoch
+        f1_epoch = f1_score_from_logits(all_logits, all_labels)
+        print("f1",f1_epoch)
     print('EPOCH: {:04d} ITER: {:04d} | TRAIN [LOSS|ACC.]: PRI {:.4f} {:.4f} AUX {:.4f} {:.4f} || '
           'TEST [LOSS|ACC.]: PRI {:.4f} {:.4f} AUX {:.4f} {:.4f}'
           .format(index, k, avg_cost[index][0], avg_cost[index][1], avg_cost[index][2], avg_cost[index][3],
